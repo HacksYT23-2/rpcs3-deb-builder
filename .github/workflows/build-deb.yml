@@ -53,7 +53,6 @@ jobs:
             echo "version=$version"
             echo "tag=$tag"
           } >> "$GITHUB_OUTPUT"
-
   build:
     needs: check
     if: needs.check.outputs.build == 'true'
@@ -62,10 +61,10 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-24.04
-            suffix: linux64
+            repo: RPCS3/rpcs3-binaries-linux
           - arch: arm64
             runner: ubuntu-24.04-arm
-            suffix: linux_aarch64
+            repo: RPCS3/rpcs3-binaries-linux-arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -74,10 +73,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "${{ needs.check.outputs.upstream_tag }}" \
-            --repo "$UPSTREAM" \
-            --pattern "*_${{ matrix.suffix }}.AppImage" \
-            --output rpcs3.AppImage
+          set -euo pipefail
+          repo="${{ matrix.repo }}"
+          json=$(gh api "repos/$repo/releases/latest")
+          echo "Assets in latest $repo release:"
+          jq -r '.assets[].name' <<<"$json"
+          asset=$(jq -r '.assets[].name | select(endswith(".AppImage"))' <<<"$json" | head -n1)
+          [ -n "$asset" ] || { echo "No .AppImage asset found"; exit 1; }
+          gh release download "$(jq -r .tag_name <<<"$json")" \
+            --repo "$repo" --pattern "$asset" --output rpcs3.AppImage
+
+      - name: Build .deb
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          chmod +x make-rpcs3-deb.sh
+          ./make-rpcs3-deb.sh ./rpcs3.AppImage "${{ needs.check.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: "*.deb"
 
       - name: Build .deb
         env:
