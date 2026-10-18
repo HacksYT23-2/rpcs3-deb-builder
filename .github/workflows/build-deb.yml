@@ -13,15 +13,11 @@ on:
 permissions:
   contents: write
 
-env:
-  UPSTREAM: RPCS3/rpcs3-binaries-linux
-
 jobs:
   check:
     runs-on: ubuntu-24.04
     outputs:
       build: ${{ steps.c.outputs.build }}
-      upstream_tag: ${{ steps.c.outputs.upstream_tag }}
       version: ${{ steps.c.outputs.version }}
       tag: ${{ steps.c.outputs.tag }}
     steps:
@@ -31,76 +27,74 @@ jobs:
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          json=$(gh api "repos/$UPSTREAM/releases/latest")
-          upstream_tag=$(jq -r .tag_name <<<"$json")
-          asset=$(jq -r '.assets[].name | select(endswith("_linux64.AppImage"))' <<<"$json" | head -n1)
-          echo "Upstream asset: $asset"
+          json=$(gh api repos/RPCS3/rpcs3-binaries-linux/releases/latest)
+          echo "Assets in latest amd64 release:"
+          jq -r '.assets[].name' <<<"$json"
 
-          # e.g. rpcs3-v0.0.38-18120-abcdef12_linux64.AppImage -> 0.0.38+18120
+          asset=$(jq -r '.assets[].name | select(endswith(".AppImage"))' <<<"$json" | head -n1)
+          [ -n "$asset" ] || { echo "No .AppImage asset found"; exit 1; }
+
           version=$(sed -nE 's/^rpcs3-v([0-9.]+)-([0-9]+)-.*/\1+\2/p' <<<"$asset")
           [ -n "$version" ] || { echo "Could not parse version from: $asset"; exit 1; }
           tag="v${version//+/-}"
 
+          build=true
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "${FORCE:-false}" != "true" ]; then
             echo "Release $tag already exists, nothing to do."
             build=false
-          else
-            build=true
           fi
-          {
-            echo "build=$build"
-            echo "upstream_tag=$upstream_tag"
-            echo "version=$version"
-            echo "tag=$tag"
-          } >> "$GITHUB_OUTPUT"
+
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   build:
     needs: check
     if: needs.check.outputs.build == 'true'
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
             runner: ubuntu-24.04
             repo: RPCS3/rpcs3-binaries-linux
+            optional: false
           - arch: arm64
             runner: ubuntu-24.04-arm
             repo: RPCS3/rpcs3-binaries-linux-arm64
+            optional: true
     runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.optional }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Download upstream AppImage
+        id: dl
         env:
           GH_TOKEN: ${{ github.token }}
+          FALLBACK_VERSION: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
           repo="${{ matrix.repo }}"
           json=$(gh api "repos/$repo/releases/latest")
           echo "Assets in latest $repo release:"
           jq -r '.assets[].name' <<<"$json"
+
           asset=$(jq -r '.assets[].name | select(endswith(".AppImage"))' <<<"$json" | head -n1)
           [ -n "$asset" ] || { echo "No .AppImage asset found"; exit 1; }
+
           gh release download "$(jq -r .tag_name <<<"$json")" \
             --repo "$repo" --pattern "$asset" --output rpcs3.AppImage
 
-      - name: Build .deb
-        env:
-          ARCH: ${{ matrix.arch }}
-        run: |
-          chmod +x make-rpcs3-deb.sh
-          ./make-rpcs3-deb.sh ./rpcs3.AppImage "${{ needs.check.outputs.version }}"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: deb-${{ matrix.arch }}
-          path: "*.deb"
+          version=$(sed -nE 's/^rpcs3-v([0-9.]+)-([0-9]+)-.*/\1+\2/p' <<<"$asset")
+          echo "version=${version:-$FALLBACK_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build .deb
         env:
           ARCH: ${{ matrix.arch }}
         run: |
           chmod +x make-rpcs3-deb.sh
-          ./make-rpcs3-deb.sh ./rpcs3.AppImage "${{ needs.check.outputs.version }}"
+          ./make-rpcs3-deb.sh ./rpcs3.AppImage "${{ steps.dl.outputs.version }}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -120,14 +114,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           tag="${{ needs.check.outputs.tag }}"
+          ls -l *.deb
+
+          cat > notes.md <<'NOTES'
+          Unofficial .deb repackaging of RPCS3. Not affiliated with RPCS3.
+
+          RPCS3 is GPLv2. Source: https://github.com/RPCS3/rpcs3
+
+          Install: `sudo apt install ./rpcs3_*_amd64.deb` (or arm64).
+          NOTES
+
           gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$tag" ./*.deb \
             --repo "$GITHUB_REPOSITORY" \
             --title "RPCS3 ${{ needs.check.outputs.version }}" \
-            --notes "Unofficial .deb repackaging of RPCS3 ${{ needs.check.outputs.version }}. Not affiliated with RPCS3.
-
-          RPCS3 is GPLv2. Source: https://github.com/RPCS3/rpcs3
-          Upstream binary release: https://github.com/$UPSTREAM/releases/tag/${{ needs.check.outputs.upstream_tag }}
-
-          Install: \`sudo apt install ./rpcs3_*_amd64.deb\` (or arm64)."
+            --notes-file notes.md
