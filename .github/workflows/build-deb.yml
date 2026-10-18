@@ -1,0 +1,117 @@
+name: Build RPCS3 .deb
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if this version was already released
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: RPCS3/rpcs3-binaries-linux
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.c.outputs.build }}
+      upstream_tag: ${{ steps.c.outputs.upstream_tag }}
+      version: ${{ steps.c.outputs.version }}
+      tag: ${{ steps.c.outputs.tag }}
+    steps:
+      - id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          json=$(gh api "repos/$UPSTREAM/releases/latest")
+          upstream_tag=$(jq -r .tag_name <<<"$json")
+          asset=$(jq -r '.assets[].name | select(endswith("_linux64.AppImage"))' <<<"$json" | head -n1)
+          echo "Upstream asset: $asset"
+
+          # e.g. rpcs3-v0.0.38-18120-abcdef12_linux64.AppImage -> 0.0.38+18120
+          version=$(sed -nE 's/^rpcs3-v([0-9.]+)-([0-9]+)-.*/\1+\2/p' <<<"$asset")
+          [ -n "$version" ] || { echo "Could not parse version from: $asset"; exit 1; }
+          tag="v${version//+/-}"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "${FORCE:-false}" != "true" ]; then
+            echo "Release $tag already exists, nothing to do."
+            build=false
+          else
+            build=true
+          fi
+          {
+            echo "build=$build"
+            echo "upstream_tag=$upstream_tag"
+            echo "version=$version"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            suffix: linux64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            suffix: linux_aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download upstream AppImage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ needs.check.outputs.upstream_tag }}" \
+            --repo "$UPSTREAM" \
+            --pattern "*_${{ matrix.suffix }}.AppImage" \
+            --output rpcs3.AppImage
+
+      - name: Build .deb
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          chmod +x make-rpcs3-deb.sh
+          ./make-rpcs3-deb.sh ./rpcs3.AppImage "${{ needs.check.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: "*.deb"
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ needs.check.outputs.tag }}"
+          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" ./*.deb \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "RPCS3 ${{ needs.check.outputs.version }}" \
+            --notes "Unofficial .deb repackaging of RPCS3 ${{ needs.check.outputs.version }}. Not affiliated with RPCS3.
+
+          RPCS3 is GPLv2. Source: https://github.com/RPCS3/rpcs3
+          Upstream binary release: https://github.com/$UPSTREAM/releases/tag/${{ needs.check.outputs.upstream_tag }}
+
+          Install: \`sudo apt install ./rpcs3_*_amd64.deb\` (or arm64)."
